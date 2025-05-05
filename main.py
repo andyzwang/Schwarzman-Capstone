@@ -1,3 +1,4 @@
+# Import/Config
 import os
 import pandas as pd
 from tqdm import tqdm
@@ -7,9 +8,16 @@ import json
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("GPT_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-client = OpenAI(api_key=OPENAI_API_KEY
-)
+# Load definitions
+
+
+
+# Prompt Builder
+
+
+
 
 
 
