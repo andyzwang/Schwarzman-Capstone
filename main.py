@@ -125,9 +125,9 @@ def process_dir(base_name: str, suffix: str, data_root="raw", results_dir="resul
 
 if __name__ == "__main__":
     # Directories to process
-    bases = ["privacy"]
+    bases = ["privacy, data_protection"]
     # Suffixes you want to generate
-    suffixes = ["delta"]
+    suffixes = ["alpha, beta, delta, gamma"]
 
     for suf in suffixes:
         for base in bases:
