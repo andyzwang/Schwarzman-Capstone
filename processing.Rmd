@@ -175,7 +175,7 @@ alphas <- compute_kripp_alpha(
   rater = "classifier"
 )
 
-write_csv(alphas, "formatted/alphas.csv")
+write_csv(alphas, "formatted/analysis/alphas.csv")
 ```
 
 ```{r kappa}
@@ -219,11 +219,9 @@ kappa_tbl <- map_dfr(flag_cols, function(col) {
   })
 })
 
-# ------------------------------------
-# kappa_tbl: flag, pair, kappa
-print(kappa_tbl)
+write_csv(kappa_tbl, "formatted/analysis/kappa_full.csv")
 
-# Optional: pivot to wide matrix: rows = flag, cols = pair
+# pivot to wider matrix
 kappa_wide <- kappa_tbl %>%
   pivot_wider(names_from = pair, values_from = kappa) %>%
   rowwise() %>%
@@ -233,6 +231,8 @@ kappa_wide <- kappa_tbl %>%
     kappa_max  = max(c_across(where(is.numeric)), na.rm = TRUE)
   ) %>%
   ungroup()
+
+write_csv(kappa_wide, "formatted/analysis/kappa_wide.csv")
 
 ```
 

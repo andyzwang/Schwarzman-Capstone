@@ -1,3 +1,14 @@
+"""
+main.py  ──────────────────────────────────────────────────────────
+• Walk every .txt file under raw/<category_name>/…
+• Ask OpenAI GPT-4.1-mini to classify the full text into 13 privacy-law fields
+• Save one CSV per “trial” (alpha, beta, …) in results/
+
+To run:
+    export GPT_KEY="sk-···"
+    python batch_classify.py
+"""
+
 import os
 import json
 from pathlib import Path
@@ -7,15 +18,14 @@ from tqdm import tqdm
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# ─── Setup ────────────────────────────────────────────────────────────────────
-load_dotenv()
+# ── 0. Initialise OpenAI client ────────────────────────────────────────────
+load_dotenv()                                     # load GPT_KEY from .env
 client = OpenAI(api_key=os.getenv("GPT_KEY"))
 
-# Load definitions
+# ── 1. Load the field definitions that go into the system prompt ───────────
 DEFINITIONS = Path("classifier_definitions.txt").read_text(encoding="utf-8")
 
-
-# Build prompt
+# ── 2. Prompt builder: embeds the full law text + instructions ─────────────
 def build_prompt(text):
     return f"""
 你是一名法律 NLP 助理，专门从事数据保护和隐私法规方面的工作。
@@ -50,85 +60,76 @@ def build_prompt(text):
 \"\"\"
 """
 
-
-# Classification function
-def classify_document(text):
+# ── 3. Single-document classifier using the OpenAI chat API ────────────────
+def classify_document(text: str) -> dict:
+    """Return a dict with the 13 required keys. On failure, return empties."""
     prompt = build_prompt(text)
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages=[
-                {"role": "user", "content": prompt},
-                {"role": "system",
-                 "content": "你是一个法律NLP助手，返回严格JSON，不要额外说明。你们要根据我给你们的提示，帮助我对与隐私相关的法律文件进行分类。如果答案不符合我提供给你们的模式，将受到重罚--如果出现这种情况，请再试一次。"}
-            ],
             temperature=0.2,
             max_tokens=800,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system",
+                 "content": "你是法律NLP助手。严格输出 JSON; 若格式错误重新尝试。"},
+                {"role": "user", "content": prompt}
+            ]
         )
         parsed = json.loads(resp.choices[0].message.content.strip())
 
-        # Ensure all keys exist
-        return {
-            "title": parsed.get("title", ""),
-            "date_enacted": parsed.get("date_enacted", ""),
-            "jurisdiction": parsed.get("jurisdiction", ""),
-            "jurisdiction_name": parsed.get("jurisdiction_name", ""),
-            "general_reference": parsed.get("general_reference", False),
-            "data_category": parsed.get("data_category", []),
-            "individual_rights": parsed.get("individual_rights", []),
-            "handler_responsibilities": parsed.get("handler_responsibilities", []),
-            "sector": parsed.get("sector", []),
-            "keywords": parsed.get("keywords", []),
-            "solove_classification": parsed.get("solove_classification", []),
-            "synopsis": parsed.get("synopsis", []),
-            "pipl_mention": parsed.get("pipl_mention", [])
-        }
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, AttributeError) as e:   # bad JSON → empty dict
         print("⛔ JSON decode error:", e)
-        print("Raw response:", resp.choices[0].message.content)
-        return {k: "" if isinstance(v, str) else [] for k, v in classify_document.__annotations__.items()}
-    except Exception as e:
-        print("⚠️ Error:", e)
-        return {k: "" if isinstance(v, str) else [] for k, v in classify_document.__annotations__.items()}
+        return {}
 
+    except Exception as e:                                # network / quota / other
+        print("⚠️ OpenAI error:", e)
+        return {}
 
-def process_dir(base_name: str, suffix: str, data_root="raw", results_dir="results"):
+    # Ensure all 13 keys exist so DataFrame columns align
+    default = {"title": "", "date_enacted": "", "jurisdiction": "",
+               "jurisdiction_name": "", "general_reference": False,
+               "data_category": "", "individual_rights": [],
+               "handler_responsibilities": [], "sector": [],
+               "keywords": [], "solove_classification": [],
+               "synopsis": "", "pipl_mention": False}
+    return {k: parsed.get(k, default[k]) for k in default}
+
+# ── 4. Walk one base directory and write a CSV for a given “trial” ─────────
+def process_dir(base_name: str,
+                suffix: str,
+                data_root: str = "raw",
+                results_dir: str = "results") -> None:
     """
-    Walk through raw/{base_name}, classify each .txt,
-    and dump results to results/{base_name}-4.1-mini_{suffix}.csv
+    • Reads every .txt in raw/<base_name>/*
+    • Runs GPT classification
+    • Saves to results/<base_name>-4.1-mini_<suffix>.csv
     """
-    DATA_DIR = os.path.join(data_root, base_name)
-    os.makedirs(results_dir, exist_ok=True)
+    in_dir = Path(data_root) / base_name
+    out_dir = Path(results_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    results = []
-    for root, dirs, files in os.walk(DATA_DIR):
-        dirs.sort()
-        for file in tqdm(files, desc=f"Scanning {base_name}", unit="file", leave=False):
-            if not file.endswith(".txt"):
-                continue
-            path = os.path.join(root, file)
-            text = open(path, "r", encoding="utf-8").read().strip()
+    records = []
+    for path in tqdm(sorted(in_dir.rglob("*.txt")),
+                     desc=f"{base_name}/{suffix}", unit="file"):
+        text = path.read_text(encoding="utf-8").strip()
+        rec  = classify_document(text)
+        rec.update({
+            "file_path": str(path.relative_to(data_root)),
+            "top_level_category": base_name
+        })
+        records.append(rec)
 
-            rec = classify_document(text)  # your existing classifier
-            rec["file_path"] = os.path.relpath(path, data_root)
-            rec["top_level_category"] = base_name
+    out_file = out_dir / f"{base_name}-4.1-mini_{suffix}.csv"
+    pd.DataFrame(records).to_csv(out_file, index=False, encoding="utf-8-sig")
+    print(f"✔  {len(records)} docs → {out_file}")
 
-            results.append(rec)
-
-    out_name = f"{base_name}-4.1-mini_{suffix}.csv"
-    out_path = os.path.join(results_dir, out_name)
-    df = pd.DataFrame(results)
-    df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"\nWrote {len(results)} records to {out_path}")
-
-
+# ── 5. Main loop: iterate over base dirs × trial suffixes ──────────────────
 if __name__ == "__main__":
-    # Directories to process
-    bases = ["privacy, data_protection"]
-    # Suffixes you want to generate
-    suffixes = ["alpha, beta, delta, gamma"]
+    bases   = ["privacy", "data_protection"]          # sub-folders in raw/
+    trials  = ["alpha", "beta", "gamma", "delta"]     # four independent runs
 
-    for suf in suffixes:
+    for trial in trials:
         for base in bases:
-            process_dir(base_name=base, suffix=suf)
+            process_dir(base_name=base, suffix=trial)
