@@ -14,6 +14,7 @@ client = OpenAI(api_key=os.getenv("GPT_KEY"))
 # Load definitions
 DEFINITIONS = Path("classifier_definitions.txt").read_text(encoding="utf-8")
 
+
 # Build prompt
 def build_prompt(text):
     return f"""
@@ -30,7 +31,6 @@ def build_prompt(text):
 {{
   "title": "字符串",
   "date_enacted": "YYYY-MM-DD",
-  "legal_level": "字符串",
   "jurisdiction": "字符串",
   "jurisdiction_name": "字符串",
   "general_reference": true 或 false,
@@ -50,15 +50,17 @@ def build_prompt(text):
 \"\"\"
 """
 
+
 # Classification function
 def classify_document(text):
     prompt = build_prompt(text)
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
-                {"role": "system", "content": "你是一个法律NLP助手，返回严格JSON，不要额外说明。"},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
+                {"role": "system",
+                 "content": "你是一个法律NLP助手，返回严格JSON，不要额外说明。你们要根据我给你们的提示，帮助我对与隐私相关的法律文件进行分类。如果答案不符合我提供给你们的模式，将受到重罚--如果出现这种情况，请再试一次。"}
             ],
             temperature=0.2,
             max_tokens=800,
@@ -70,7 +72,6 @@ def classify_document(text):
         return {
             "title": parsed.get("title", ""),
             "date_enacted": parsed.get("date_enacted", ""),
-            "legal_level": parsed.get("legal_level", ""),
             "jurisdiction": parsed.get("jurisdiction", ""),
             "jurisdiction_name": parsed.get("jurisdiction_name", ""),
             "general_reference": parsed.get("general_reference", False),
@@ -92,27 +93,42 @@ def classify_document(text):
         return {k: "" if isinstance(v, str) else [] for k, v in classify_document.__annotations__.items()}
 
 
-# ——— Main loop ———
-DATA_DIR = "raw/data_protection"
-RESULTS_DIR = "results"
-os.makedirs(RESULTS_DIR, exist_ok=True)
+def process_dir(base_name: str, suffix: str, data_root="raw", results_dir="results"):
+    """
+    Walk through raw/{base_name}, classify each .txt,
+    and dump results to results/{base_name}-4.1-mini_{suffix}.csv
+    """
+    DATA_DIR = os.path.join(data_root, base_name)
+    os.makedirs(results_dir, exist_ok=True)
 
-results = []
-for root, dirs, files in os.walk(DATA_DIR):
-    dirs.sort()
-    # Outer bar to show directory progress
-    for file in tqdm(files, desc=f"Scanning {os.path.basename(root)}", unit="file", leave=False):
-        if not file.endswith(".txt"):
-            continue
-        path = os.path.join(root, file)
-        text = open(path, "r", encoding="utf-8").read().strip()
-        rec = classify_document(text)
-        rec["file_path"] = os.path.relpath(path, DATA_DIR)
-        rec["top_level_category"] = os.path.basename(root)
-        results.append(rec)
+    results = []
+    for root, dirs, files in os.walk(DATA_DIR):
+        dirs.sort()
+        for file in tqdm(files, desc=f"Scanning {base_name}", unit="file", leave=False):
+            if not file.endswith(".txt"):
+                continue
+            path = os.path.join(root, file)
+            text = open(path, "r", encoding="utf-8").read().strip()
 
-# Save to CSV
-df = pd.DataFrame(results)
-df.to_csv(os.path.join(RESULTS_DIR, "data_protection_run.csv"),
-          index=False,
-          encoding="utf-8-sig")
+            rec = classify_document(text)  # your existing classifier
+            rec["file_path"] = os.path.relpath(path, data_root)
+            rec["top_level_category"] = base_name
+
+            results.append(rec)
+
+    out_name = f"{base_name}-4.1-mini_{suffix}.csv"
+    out_path = os.path.join(results_dir, out_name)
+    df = pd.DataFrame(results)
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"\nWrote {len(results)} records to {out_path}")
+
+
+if __name__ == "__main__":
+    # Directories to process
+    bases = ["privacy"]
+    # Suffixes you want to generate
+    suffixes = ["delta"]
+
+    for suf in suffixes:
+        for base in bases:
+            process_dir(base_name=base, suffix=suf)

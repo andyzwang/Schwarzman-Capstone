@@ -1,0 +1,675 @@
+---
+title: "Privacy Cleanup"
+output: html_notebook
+---
+
+```{r setup, echo = FALSE}
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(irr)
+library(purrr)
+library(krippendorffsalpha)
+
+# Define label sets
+rights <- c(
+  "Know & Decide", "Access & Copy", "Rectification", "Erasure", "Explanation",
+  "Next of Kin", "Convenient Exercise & Remedy"
+)
+
+responsibilities <- c(
+  "Security & Management", "Protection Officer", "Local Representative",
+  "Compliance Audits", "Impact Assessment", "Incident Response & Notification",
+  "Platform Compliance", "Outsourced Processing"
+)
+
+keywords <- c(
+  "Parental Consent for Minors", "Cross-Border Transfer",
+  "Automated Decision-Making Transparency", "De-Identification", "Anonymization"
+)
+
+sectors <- c(
+  "Agriculture, Forestry, Animal Husbandry & Fishery", "Mining", "Manufacturing",
+  "Production & Supply of Electricity, Heat, Gas & Water", "Construction",
+  "Wholesale & Retail Trade", "Transportation, Storage & Postal Services",
+  "Accommodation & Catering", "Information Transmission, Software & IT Services",
+  "Financial Intermediation", "Real Estate", "Leasing & Business Services",
+  "Scientific Research & Technical Services",
+  "Water Conservancy, Environment & Public Facilities Management",
+  "Resident Services, Repair & Other Services", "Education",
+  "Health & Social Work", "Culture, Sports & Entertainment",
+  "Public Administration, Social Security & Social Organizations",
+  "International Organizations"
+)
+
+solove_classifiers <- c(
+  "Information Collection", "Information Processing",
+  "Information Dissemination", "Invasion"
+)
+
+desired_order <- c(
+  "title", "file_path", "date_enacted", "jurisdiction", "jurisdiction_name",
+  "top_level_category", "general_reference", "pipl_mention", "sensitive_data"
+)
+```
+
+```{r import, warning=FALSE}
+library(readr)
+
+prefixes <- c("data_protection", "privacy")
+types <- c("alpha", "beta", "delta", "gamma")
+
+# Generate all file paths combinations
+files_df <- expand.grid(prefix = prefixes, type = types, stringsAsFactors = FALSE)
+
+# Read and combine by type
+datasets <- lapply(types, function(t) {
+  files <- with(files_df, paste0("results/", prefix, "-4.1-mini_", t, ".csv")[type == t])
+  do.call(rbind, lapply(files, read_csv, show_col_types = FALSE))
+})
+
+names(datasets) <- types
+
+alpha <- datasets$alpha
+beta <- datasets$beta
+delta <- datasets$delta
+gamma <- datasets$gamma
+
+```
+
+
+```{r cleanup_function}
+make_clean_colname <- function(text, prefix) {
+  text %>%
+    tolower() %>%
+    gsub("&", "and", ., fixed = TRUE) %>%
+    gsub("-", "_", .) %>%
+    gsub("[^a-z0-9]+", "_", .) %>%
+    gsub("_$", "", .) %>%
+    paste0(prefix, .)
+}
+
+add_presence_cols <- function(df, labels, prefix, source_col) {
+  named_labels <- setNames(labels, sapply(labels, make_clean_colname, prefix = prefix))
+  for (colname in names(named_labels)) {
+    label <- named_labels[[colname]]
+    df[[colname]] <- str_detect(df[[source_col]], fixed(label))
+  }
+  df
+}
+
+process_df <- function(df, df_name) {
+  df %>%
+    mutate(
+      classifier = df_name,
+      jurisdiction_name = if_else(
+        jurisdiction == "national" & 
+          !str_detect(jurisdiction_name, "Special Administrative Region"),
+        "People's Republic of China",
+        jurisdiction_name
+      ),
+      jurisdiction_name = str_replace(jurisdiction_name, "(City).*", "\\1"),
+      sensitive_data = if_else(data_category == "general", FALSE, TRUE)
+    ) %>%
+    add_presence_cols(rights, "right_", "individual_rights") %>%
+    add_presence_cols(responsibilities, "resp_", "handler_responsibilities") %>%
+    add_presence_cols(keywords, "kw_", "keywords") %>%
+    add_presence_cols(sectors, "sector_", "sector") %>%
+    add_presence_cols(solove_classifiers, "solove_", "solove_classification") %>%
+    select(-data_category:-solove_classification) %>%
+    select(all_of(desired_order), everything())
+}
+
+alpha <- process_df(alpha, "alpha")
+beta  <- process_df(beta, "beta")
+gamma <- process_df(gamma, "gamma")
+delta <- process_df(delta, "delta")
+
+raw_classification <- alpha %>% rbind(beta, gamma, delta)
+
+# save to csv for now
+write.csv(raw_classification, "formatted/raw_classification.csv")
+```
+
+```{r kripp_alpha, include=FALSE}
+#-----------------------------------------------------------
+#  compute_kripp_alpha()
+#-----------------------------------------------------------
+compute_kripp_alpha <- function(df,
+                                id      = "file_path",
+                                rater   = "classifier") {
+  
+  id_sym    <- sym(id)
+  rater_sym <- sym(rater)
+  targets   <- setdiff(names(df), c(id, rater))
+  
+  map_dfr(targets, function(col) {
+    
+    # pivot just this column to units × raters
+    mat <- df %>%
+      select(!!id_sym, !!rater_sym, all_of(col)) %>%
+      pivot_wider(names_from = !!rater_sym, values_from = all_of(col)) %>%
+      select(-!!id_sym) %>%
+      mutate(across(everything(), ~ as.numeric(factor(.)))) %>%
+      as.matrix()
+    
+    fit <- krippendorffs.alpha(
+      data    = mat,
+      level     = "nominal",
+      method    = "analytical",
+      confint = FALSE,
+      verbose = TRUE
+    )
+    print(col)
+    print(fit$alpha.hat)
+    tibble(
+      column = col,
+      alpha  = round(fit$alpha.hat, 3),
+    )
+  })
+}
+
+alphas <- compute_kripp_alpha(
+  raw_classification,
+  id    = "file_path",
+  rater = "classifier"
+)
+
+write_csv(alphas, "formatted/alphas.csv")
+```
+
+```{r kappa}
+df_long <- raw_classification
+id_col <- "file_path"
+rater_col <- "classifier"
+
+# --- 1. which columns to evaluate? ---------------------------------
+flag_cols <- df_long %>%
+  select(where(is.logical)) %>%
+  names()
+
+# --- 2. all pair combinations of classifiers -----------------------
+raters <- sort(unique(df_long[[rater_col]]))
+pairs <- combn(raters, 2, simplify = FALSE) # list of c("alpha","beta"), etc.
+
+# --- 3. helper ------------------------------------------------------
+kappa_pair <- function(df, col, r1, r2) {
+  wide <- df %>%
+    filter(.data[[rater_col]] %in% c(r1, r2)) %>%
+    select(.data[[id_col]], .data[[rater_col]], !!sym(col)) %>%
+    pivot_wider(names_from = .data[[rater_col]], values_from = !!sym(col))
+
+  # keep units with ratings from both raters
+  wide <- wide %>% filter(!if_any(all_of(c(r1, r2)), is.na))
+  if (nrow(wide) == 0) {
+    return(NA_real_)
+  } # no overlap
+
+  kappa2(wide[c(r1, r2)])$value
+}
+
+# --- 4. compute κ for every col × pair -----------------------------
+kappa_tbl <- map_dfr(flag_cols, function(col) {
+  map_dfr(pairs, function(p) {
+    tibble(
+      column = col,
+      pair   = paste(p, collapse = "_"),
+      kappa  = round(kappa_pair(df_long, col, p[1], p[2]), 3)
+    )
+  })
+})
+
+# ------------------------------------
+# kappa_tbl: flag, pair, kappa
+print(kappa_tbl)
+
+# Optional: pivot to wide matrix: rows = flag, cols = pair
+kappa_wide <- kappa_tbl %>%
+  pivot_wider(names_from = pair, values_from = kappa) %>%
+  rowwise() %>%
+  mutate(
+    kappa_mean = round(mean(c_across(where(is.numeric)), na.rm = TRUE), 3),
+    kappa_min  = min(c_across(where(is.numeric)), na.rm = TRUE),
+    kappa_max  = max(c_across(where(is.numeric)), na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+```
+
+
+```{r majority-rule}
+df_long <- raw_classification
+
+id_col <- "file_path"
+rater_col <- "classifier"
+
+flag_cols <- df_long %>%
+  select(where(is.logical)) %>%
+  names()
+
+meta_cols <- setdiff(names(df_long), c(rater_col, flag_cols, id_col))
+
+df_majority <- df_long %>%
+  group_by(across(all_of(id_col))) %>% # 1 row per file
+  summarise(
+    across(all_of(meta_cols), ~ first(na.omit(.x))),
+    across(all_of(flag_cols),
+      list(
+        maj = ~ sum(.x, na.rm = TRUE) >= 3, # ≥3 of 4 raters
+        any = ~ any(.x, na.rm = TRUE) # at least 1 TRUE
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+```
+
+```{r summary-stats}
+# 1. identify the core flag names (everything that ends with "_maj")
+maj_cols  <- df_final %>% select(ends_with("_maj")) %>% names()
+flag_core <- str_remove(maj_cols, "_maj$")           # "right_access_and_copy", …
+
+# 2. build the matching *_any column names
+any_cols  <- paste0(flag_core, "_any")
+
+# 3. summarise: proportion TRUE  (×100 for percent)
+flag_summary <- df_final %>% 
+  summarise(
+    across(all_of(maj_cols), ~ round(mean(.x, na.rm = TRUE) * 100, 3), .names = "{.col}_pct"),
+    across(all_of(any_cols), ~ round(mean(.x, na.rm = TRUE) * 100, 3), .names = "{.col}_pct")
+  ) %>% 
+  pivot_longer(everything(),
+               names_to  = c("flag", ".value"),
+               names_pattern = "(.*)_(maj|any)_pct") %>%
+  mutate(
+    diff = any - maj
+  )
+
+print(flag_summary)
+
+sapply(df_majority, function(x) mean(is.na(x))) * 100
+
+```
+
+
+```{r privacy_processing}
+
+privacy_national <- privacy %>%
+  filter(jurisdiction == "national") %>%
+  filter(!str_detect(jurisdiction_name, "Special Administrative Region")) %>%
+  mutate(jurisdiction_name = "People's Republic of China")
+
+privacy_provincial <- privacy %>%
+  filter(jurisdiction=="provincial") %>%
+  filter(jurisdiction_name != "Enshi Tujia and Miao Autonomous Prefecture") %>%
+  filter(jurisdiction_name != "Honghe Hani and Yi Autonomous Prefecture")
+
+privacy_local <- privacy %>%
+  filter(jurisdiction == "city") %>%
+  mutate(jurisdiction_name = jurisdiction_name %>%
+      str_replace("City", "") %>%           # remove "City"
+      str_trim() %>%                        # strip leading/trailing spaces
+      paste("City")                         # add " City" at the end
+  )
+
+privacy_processed <- privacy %>%
+  filter(jurisdiction != "national") %>%
+  bind_rows(privacy_national) %>%
+  filter(jurisdiction != "provincial") %>%
+  bind_rows(privacy_provincial) %>%
+  filter(jurisdiction != "city") %>%
+  bind_rows(privacy_local) %>%
+  relocate(top_level_category, .after = date_enacted) %>%
+  rename(legal_status = top_level_category) %>%
+  mutate(date_enacted = dmy(date_enacted))
+
+write_csv(privacy_processed, "formatted/privacy.csv")
+```
+
+```{r dp_processing}
+
+dp_national <- dp %>%
+  filter(jurisdiction == "national") %>%
+  filter(!str_detect(jurisdiction_name, "Special Administrative Region")) %>%
+  mutate(jurisdiction_name = "People's Republic of China")
+
+dp_provincial <- dp %>%
+  filter(jurisdiction=="provincial")
+
+dp_local <- dp %>%
+  filter(jurisdiction == "city") %>%
+  mutate(jurisdiction_name = jurisdiction_name %>%
+      str_replace("City", "") %>%           # remove "City"
+      str_trim() %>%                        # strip leading/trailing spaces
+      paste("City")                         # add " City" at the end
+  )
+
+dp_processed <- dp %>%
+  filter(jurisdiction != "national") %>%
+  bind_rows(dp_national) %>%
+  filter(jurisdiction != "provincial") %>%
+  bind_rows(dp_provincial) %>%
+  filter(jurisdiction != "city") %>%
+  bind_rows(dp_local) %>%
+  relocate(top_level_category, .after = date_enacted) %>%
+  rename(legal_status = top_level_category)%>%
+  mutate(date_enacted = dmy(date_enacted))
+
+write_csv(dp_processed, "formatted/data_protection.csv")
+```
+
+```{r intro-stats}
+
+dp_processed %>%
+  group_by(legal_status) %>%
+  summarise(n = n(), .groups = "drop") %>%      # count per group, then ungroup
+  mutate(percent = n / sum(n) * 100) 
+```
+
+```{r viz 1}
+
+df <- dp_processed %>% 
+  bind_rows(privacy_processed)
+
+df <- df %>% mutate(
+  year = year(date_enacted))
+
+counts <- df %>%
+  group_by(year, folder) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  filter(year >= 2004) %>%
+  arrange(asc(year))
+
+ggplot(counts, aes(x = factor(year), y = count, fill = folder)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Legislation by Keyword Per Year",
+    x = "Year",
+    y = "Number of Documents",
+    fill = "Category"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")+ 
+  scale_fill_discrete(labels = c("privacy" = "Privacy", "data protection" = "Personal Information Protection")) + 
+  geom_vline(xintercept = which(levels(factor(counts$year)) == "2021"), 
+             linetype = "dashed", color = "black")
+
+```
+```{r}
+privacy_processed %>%
+  group_by(general_reference) %>%
+  summarise(n = n(), .groups = "drop") %>%      # count per group, then ungroup
+  mutate(percent = n / sum(n) * 100) 
+
+dp_processed %>%
+  group_by(general_reference) %>%
+  summarise(n = n(), .groups = "drop") %>%      # count per group, then ungroup
+  mutate(percent = n / sum(n) * 100) 
+```
+
+```{r viz 2}
+
+privacy_processed <- privacy_processed %>% mutate(
+  year = year(date_enacted))
+
+counts <- privacy_processed %>%
+  group_by(year, folder) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  filter(!is.na(year)) %>%
+  arrange(year)
+
+ggplot(counts, aes(x = factor(year), y = count, fill = folder)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Privacy-Related Legislation",
+    x = "Year",
+    y = "Number of Documents",
+    fill = "Category"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")+ 
+  scale_fill_manual(
+    values = c("privacy" = "#00BFC4", "data protection" = "gray"),
+    labels = c("privacy" = "Privacy", "data protection" = "Data Protection")
+  ) + 
+  geom_vline(xintercept = which(levels(factor(counts$year)) == "2021"), 
+             linetype = "dashed", color = "black")
+```
+
+```{r}
+new <- df %>%
+  filter(general_reference == "FALSE") %>%
+  mutate(year = year(date_enacted),
+         before_pipl = if_else(year < 2021, TRUE, FALSE),
+         n_rights = str_count(individual_rights, ",") + ifelse(str_detect(individual_rights, "\\[\\s*\\]"), 0, 1))
+
+mean_before_after <- new %>%
+  group_by(before_pipl) %>%
+  summarize(mean = mean(n_rights))
+
+
+```
+
+```{r}
+rights <- c(
+  "Know & Decide", "Access & Copy", "Rectification",
+  "Erasure", "Explanation", "Next of Kin", "Convenient Exercise & Remedy"
+)
+
+for (right in rights) {
+  colname <- make.names(right)  # Safe column name
+  new[[colname]] <- str_detect(new$individual_rights, fixed(right))
+}
+
+new_long <- new %>%
+  pivot_longer(cols = all_of(make.names(rights)),
+               names_to = "right",
+               values_to = "present") %>%
+  filter(present == TRUE)
+
+# Your original labels after make.names()
+old_names <- make.names(c(
+  "Know & Decide", "Access & Copy", "Rectification",
+  "Erasure", "Explanation", "Next of Kin", "Convenient Exercise & Remedy"
+))
+
+# Desired display labels
+pretty_labels <- c(
+  "Know & Decide", "Access & Copy", "Rectification",
+  "Erasure", "Explanation", "Next of Kin", "Convenient Exercise & Remedy"
+)
+
+# Create named vector: names = old column names, values = display names
+label_map <- setNames(pretty_labels, old_names)
+
+new_long %>%
+  count(right, before_pipl) %>%
+  mutate(right = label_map[right]) %>%  # Replace with pretty label
+  ggplot(aes(x = reorder(right, n), y = n, fill = before_pipl)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Frequency of Individual Rights Referenced",
+    x = "Right",
+    y = "Count"
+  ) + 
+  theme_minimal() + 
+  scale_fill_manual(
+  name = "Period",
+  values = c("TRUE" = "#00bfc4", "FALSE" = "#f8766d"),
+  labels = c("TRUE" = "Pre-PIPL", "FALSE" = "Post-PIPL")
+)
+
+```
+
+```{r}
+# Define the responsibilities
+responsibilities <- c(
+  "Security & Management", "Protection Officer", "Local Representative",
+  "Compliance Audits", "Impact Assessment", "Incident Response & Notification",
+  "Platform Compliance", "Outsourced Processing"
+)
+
+# Safely create column names and detect presence
+for (resp in responsibilities) {
+  colname <- make.names(resp)
+  new[[colname]] <- str_detect(new$handler_responsibilities, fixed(resp))
+}
+
+# Pivot to long format
+new_long_resp <- new %>%
+  pivot_longer(cols = all_of(make.names(responsibilities)),
+               names_to = "responsibility",
+               values_to = "present") %>%
+  filter(present == TRUE)
+
+# Create label map
+old_resp_names <- make.names(responsibilities)
+pretty_resp_labels <- responsibilities
+label_map_resp <- setNames(pretty_resp_labels, old_resp_names)
+
+# Plot
+new_long_resp %>%
+  filter(!is.na(before_pipl)) %>%
+  count(responsibility, before_pipl) %>%
+  mutate(responsibility = label_map_resp[responsibility]) %>%
+  ggplot(aes(x = reorder(responsibility, n), y = n, fill = before_pipl)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Frequency of Data Handler Responsibilities Referenced",
+    x = "Responsibility",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(
+    name = "Period",
+    values = c("TRUE" = "#00bfc4", "FALSE" = "#f8766d"),
+    labels = c("TRUE" = "Pre-PIPL", "FALSE" = "Post-PIPL")
+  )
+```
+```{r}
+# Define the list of special PIPL terms
+keywords <- c(
+  "Parental Consent for Minors", 
+  "Cross-Border Transfer", 
+  "Automated Decision-Making Transparency", 
+  "De-Identification", 
+  "Anonymization"
+)
+
+# Create logical columns for each keyword
+for (kw in keywords) {
+  colname <- make.names(kw)
+  new[[colname]] <- str_detect(new$keywords, fixed(kw))
+}
+
+# Pivot longer
+new_long_kw <- new %>%
+  pivot_longer(cols = all_of(make.names(keywords)),
+               names_to = "keyword",
+               values_to = "present") %>%
+  filter(present == TRUE)
+
+# Pretty label mapping
+old_kw_names <- make.names(keywords)
+pretty_kw_labels <- keywords
+label_map_kw <- setNames(pretty_kw_labels, old_kw_names)
+
+# Plot
+new_long_kw %>%
+  count(keyword, before_pipl) %>%
+  mutate(keyword = label_map_kw[keyword]) %>%
+  ggplot(aes(x = reorder(keyword, n), y = n, fill = before_pipl)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Frequency of PIPL-Defined Keywords Referenced",
+    x = "Keyword",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(
+    name = "Period",
+    values = c("TRUE" = "#00bfc4", "FALSE" = "#f8766d"),
+    labels = c("TRUE" = "Pre-PIPL", "FALSE" = "Post-PIPL")
+  )
+```
+```{r}
+new <- new %>%
+  mutate(
+    n_rights = str_count(individual_rights, ",") + ifelse(str_detect(individual_rights, "\\[\\s*\\]"), 0, 1),
+    n_responsibilities = str_count(handler_responsibilities, ",") + ifelse(str_detect(handler_responsibilities, "\\[\\s*\\]"), 0, 1),
+    n_keywords = str_count(keywords, ",") + ifelse(str_detect(keywords, "\\[\\s*\\]"), 0, 1)
+  )
+
+# Group by PIPL mention (TRUE/FALSE) and calculate means
+new %>%
+  group_by(pipl_mention) %>%
+  summarise(
+    avg_rights = mean(n_rights, na.rm = TRUE),
+    avg_responsibilities = mean(n_responsibilities, na.rm = TRUE),
+    avg_keywords = mean(n_keywords, na.rm = TRUE),
+    n = n()
+  )
+
+t.test(n_rights ~ pipl_mention, data = new)
+t.test(n_responsibilities ~ pipl_mention, data = new)
+t.test(n_keywords ~ pipl_mention, data = new)
+```
+
+```{r}
+new %>% 
+  group_by(jurisdiction) %>%
+  summarise(n = n(), .groups = "drop") %>%      # count per group, then ungroup
+  mutate(percent = n / sum(n) * 100) 
+```
+
+
+```{r}
+library(tidyverse)
+
+# Convert string like "['Education', 'Health']" into list-column
+new_cleaned <- new %>%
+  mutate(sector = str_remove_all(sector, "\\[|\\]|'")) %>%     # remove brackets and quotes
+  mutate(sector = str_split(sector, ",")) %>%                  # split into character vectors
+  mutate(sector = map(sector, str_trim))                       # trim whitespace from each
+
+# Unnest sectors to long format
+sector_counts <- new_cleaned %>%
+  unnest(sector) %>%
+  distinct(file_path, sector) %>%        # optional: count each sector once per doc
+  count(sector, name = "count") %>%
+  mutate(percentage = count / nrow(new_cleaned) * 100)
+
+
+sc <- sector_counts %>%
+  arrange(desc(percentage))
+```
+
+
+```{r}
+library(tidyverse)
+
+# Convert string like "['Education', 'Health']" into list-column
+new_cleaned <- new %>%
+  mutate(solove_classification = str_remove_all(solove_classification, "\\[|\\]|'")) %>%     # remove brackets and quotes
+  mutate(solove_classification = str_split(solove_classification, ",")) %>%                  # split into character vectors
+  mutate(solove_classification = map(solove_classification, str_trim))                       # trim whitespace from each
+
+# Unnest sectors to long format
+solove_counts <- new_cleaned %>%
+  unnest(solove_classification) %>%
+  distinct(file_path, solove_classification) %>%        # optional: count each sector once per doc
+  count(solove_classification, name = "count") %>%
+  mutate(percentage = count / nrow(new_cleaned) * 100)
+
+
+sc <- solove_counts %>%
+  arrange(desc(percentage))
+```
+
+```
+
