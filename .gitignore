@@ -6,3 +6,4 @@
 .DS_Store
 .gitattributes
 .idea
+/results/old
