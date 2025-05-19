@@ -4,3 +4,5 @@
 .Rhistory
 *.Rproj
 .DS_Store
+.gitattributes
+.idea
