@@ -4,30 +4,43 @@ output: html_notebook
 ---
 
 ```{r setup, echo = FALSE}
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Sets up all necessary background components for entire workbook.
+# Output: None
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── 1. Load necessary libraries ───────────────────────────────────────────────
 library(tidyverse)
-library(ggplot2)
-library(lubridate)
-library(irr)
+library(readr)
 library(purrr)
+# lubridate for date parsing
+library(lubridate)
+# irr: functions for inter-rater reliability (Cohen’s κ)
+library(irr)
+# krippendorffsalpha: compute Krippendorff’s α for reliability
 library(krippendorffsalpha)
 
-# Define label sets
+# ── 2. Define the label sets used for multi‐select classification fields ───────
+# Individual privacy rights categories (flags for presence/absence)
 rights <- c(
   "Know & Decide", "Access & Copy", "Rectification", "Erasure", "Explanation",
   "Next of Kin", "Convenient Exercise & Remedy"
 )
 
+# Handler responsibilities categories
 responsibilities <- c(
   "Security & Management", "Protection Officer", "Local Representative",
   "Compliance Audits", "Impact Assessment", "Incident Response & Notification",
   "Platform Compliance", "Outsourced Processing"
 )
 
+# Privacy‐related keywords to detect
 keywords <- c(
   "Parental Consent for Minors", "Cross-Border Transfer",
   "Automated Decision-Making Transparency", "De-Identification", "Anonymization"
 )
 
+# Industry sectors to tag each regulation under
 sectors <- c(
   "Agriculture, Forestry, Animal Husbandry & Fishery", "Mining", "Manufacturing",
   "Production & Supply of Electricity, Heat, Gas & Water", "Construction",
@@ -42,55 +55,87 @@ sectors <- c(
   "International Organizations"
 )
 
+# Solove privacy‐harm taxonomy categories
 solove_classifiers <- c(
   "Information Collection", "Information Processing",
   "Information Dissemination", "Invasion"
 )
 
+# ── 3. Specify the  column order for final output ──────────────────────
+# These columns will be placed first in the processed data frame,
+# followed by generated flags ad metadata.
 desired_order <- c(
-  "title", "file_path", "date_enacted", "jurisdiction", "jurisdiction_name",
-  "top_level_category", "general_reference", "pipl_mention", "sensitive_data"
+  "title", # name of the regulation
+  "file_path", # source file identifier
+  "date_enacted", # enactment date
+  "jurisdiction", # national/provincial/city
+  "jurisdiction_name", # specific name of the jurisdiction
+  "top_level_category", # e.g., "privacy" vs. "data_protection"
+  "general_reference", # boolean: general vs. specific reference
+  "pipl_mention", # boolean: mentions PIPL explicitly
+  "sensitive_data" # boolean: sensitive vs. general personal data
 )
 ```
 
 ```{r import, warning=FALSE}
-library(readr)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Imports all trials from classifiers.
+# Output (df): alpha, beta, delta, gamma 
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── 1. Define the two folder prefixes and the four classifier runs ───────
 prefixes <- c("data_protection", "privacy")
 types <- c("alpha", "beta", "delta", "gamma")
 
-# Generate all file paths combinations
-files_df <- expand.grid(prefix = prefixes, type = types, stringsAsFactors = FALSE)
+# ── 2. Build a table of all (prefix, type) combinations ──────────────────
+files_df <- expand.grid(
+  prefix = prefixes,
+  type = types,
+  stringsAsFactors = FALSE
+)
 
-# Read and combine by type
-datasets <- lapply(types, function(t) {
-  files <- with(files_df, paste0("results/", prefix, "-4.1-mini_", t, ".csv")[type == t])
-  do.call(rbind, lapply(files, read_csv, show_col_types = FALSE))
-})
+# ── 3. Read & row-bind the two files for each run into a named list ──────
+datasets <- setNames(
+  lapply(types, function(t) {
+    # select the two file paths matching this run
+    paths <- with(
+      files_df,
+      paste0("results/", prefix, "-4.1-mini_", t, ".csv")[type == t]
+    )
+    # read each CSV and stack them into one data frame
+    do.call(rbind, lapply(paths, read_csv, show_col_types = FALSE))
+  }),
+  types # assign list names "alpha", "beta", etc.
+)
 
-names(datasets) <- types
-
+# ── 4. Unpack into individual data frames for convenience ────────────────
 alpha <- datasets$alpha
 beta <- datasets$beta
 delta <- datasets$delta
 gamma <- datasets$gamma
-
 ```
 
-
 ```{r cleanup_function}
+# ── Helper: Clean up free-text labels into safe column names ─────────────────
 make_clean_colname <- function(text, prefix) {
   text %>%
-    tolower() %>%
-    gsub("&", "and", ., fixed = TRUE) %>%
-    gsub("-", "_", .) %>%
-    gsub("[^a-z0-9]+", "_", .) %>%
-    gsub("_$", "", .) %>%
-    paste0(prefix, .)
+    tolower() %>% # convert to lowercase
+    gsub("&", "and", ., fixed = TRUE) %>% # replace '&' with 'and'
+    gsub("-", "_", .) %>% # replace hyphens with underscores
+    gsub("[^a-z0-9]+", "_", .) %>% # collapse any non-alphanumeric to '_'
+    gsub("_$", "", .) %>% # drop trailing underscore, if any
+    paste0(prefix, .) # prepend the desired prefix
 }
 
+# ── Helper: Add binary “presence” flags for a vector of labels ─────────────
 add_presence_cols <- function(df, labels, prefix, source_col) {
-  named_labels <- setNames(labels, sapply(labels, make_clean_colname, prefix = prefix))
+  # Build a named vector: names = new clean column names, values = label text
+  named_labels <- setNames(
+    labels,
+    sapply(labels, make_clean_colname, prefix = prefix)
+  )
+  # For each label, add a TRUE/FALSE column indicating if it appears in source_col
   for (colname in names(named_labels)) {
     label <- named_labels[[colname]]
     df[[colname]] <- str_detect(df[[source_col]], fixed(label))
@@ -98,146 +143,248 @@ add_presence_cols <- function(df, labels, prefix, source_col) {
   df
 }
 
+# ── Main pipeline: process one classifier run ──────────────────────────────
 process_df <- function(df, df_name) {
   df %>%
     mutate(
+      # 1) Tag which run this row comes from
       classifier = df_name,
+      # 2) Standardize jurisdiction_name for national vs. city suffix
       jurisdiction_name = if_else(
-        jurisdiction == "national" & 
+        jurisdiction == "national" &
           !str_detect(jurisdiction_name, "Special Administrative Region"),
         "People's Republic of China",
         jurisdiction_name
       ),
       jurisdiction_name = str_replace(jurisdiction_name, "(City).*", "\\1"),
-      sensitive_data = if_else(data_category == "general", FALSE, TRUE)
+      # 3) Derive a simple TRUE/FALSE 'sensitive_data' flag
+      sensitive_data = data_category != "general"
     ) %>%
+    # 4) Expand each multi-select list into individual TRUE/FALSE columns
     add_presence_cols(rights, "right_", "individual_rights") %>%
     add_presence_cols(responsibilities, "resp_", "handler_responsibilities") %>%
     add_presence_cols(keywords, "kw_", "keywords") %>%
     add_presence_cols(sectors, "sector_", "sector") %>%
     add_presence_cols(solove_classifiers, "solove_", "solove_classification") %>%
+    # 5) Drop the original list columns (no longer needed)
     select(-data_category:-solove_classification) %>%
+    # 6) Reorder: put the key metadata fields first, then all generated flags
     select(all_of(desired_order), everything())
 }
 
+# ── Apply the pipeline to each of the four runs ─────────────────────────────
 alpha <- process_df(alpha, "alpha")
-beta  <- process_df(beta, "beta")
+beta <- process_df(beta, "beta")
 gamma <- process_df(gamma, "gamma")
 delta <- process_df(delta, "delta")
 
-raw_classification <- alpha %>% rbind(beta, gamma, delta)
-
-# save to csv for now
-write.csv(raw_classification, "formatted/raw_classification.csv")
+# ── Combine into one long-form data frame and save ─────────────────────────
+raw_classification <- bind_rows(alpha, beta, gamma, delta)
+write_csv(raw_classification, "formatted/raw_classification.csv")
 ```
 
-```{r kripp_alpha, include=FALSE}
-#-----------------------------------------------------------
-#  compute_kripp_alpha()
-#-----------------------------------------------------------
+```{r alphas, include=FALSE}
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: compute_kripp_alpha
+# Purpose : For each non‐ID/rater column in a long‐form data frame, pivot to
+#           a units × raters matrix, compute nominal Krippendorff’s α, and
+#           return a tibble of (column, alpha) pairs.
+# Inputs  :
+#   df    – a tibble with one row per (unit, rater), e.g. file_path × classifier
+#   id    – name of the unit identifier column (default: "file_path")
+#   rater – name of the rater/classifier column (default: "classifier")
+# Output  : a tibble with columns "column" and "alpha" (rounded to three decimals)
+# ──────────────────────────────────────────────────────────────────────────────
 compute_kripp_alpha <- function(df,
-                                id      = "file_path",
-                                rater   = "classifier") {
-  
-  id_sym    <- sym(id)
+                                id = "file_path",
+                                rater = "classifier") {
+  # 1) Turn the id/rater names into symbols for tidy evaluation
+  id_sym <- sym(id)
   rater_sym <- sym(rater)
-  targets   <- setdiff(names(df), c(id, rater))
-  
+
+  # 2) Determine which columns we want to measure (all except ID & rater)
+  targets <- setdiff(names(df), c(id, rater))
+
+  # 3) Loop over each target column and compute α
   map_dfr(targets, function(col) {
-    
-    # pivot just this column to units × raters
+    # 3a) Pivot this one column to wide format:
+    #     - rows = distinct units (file_path)
+    #     - columns = each classifier (alpha, beta, …)
     mat <- df %>%
-      select(!!id_sym, !!rater_sym, all_of(col)) %>%
-      pivot_wider(names_from = !!rater_sym, values_from = all_of(col)) %>%
-      select(-!!id_sym) %>%
-      mutate(across(everything(), ~ as.numeric(factor(.)))) %>%
-      as.matrix()
-    
+      select(!!id_sym, !!rater_sym, all_of(col)) %>% # keep only ID, rater, and the target
+      pivot_wider(
+        names_from  = !!rater_sym,
+        values_from = all_of(col)
+      ) %>%
+      select(-!!id_sym) %>% # drop the ID now that row names are aligned
+      mutate(
+        # 3b) Convert every column to integer codes via factor()
+        across(everything(), ~ as.numeric(factor(.)))
+      ) %>%
+      as.matrix() # final shape: units × raters
+
+    # 3c) Compute Krippendorff’s α (nominal scale, analytical method)
     fit <- krippendorffs.alpha(
       data    = mat,
-      level     = "nominal",
-      method    = "analytical",
+      level   = "nominal",
+      method  = "analytical",
       confint = FALSE,
       verbose = TRUE
     )
-    print(col)
-    print(fit$alpha.hat)
+
+    # 3d) Return a 1‐row tibble for this column
     tibble(
       column = col,
-      alpha  = round(fit$alpha.hat, 3),
+      alpha  = round(fit$alpha.hat, 3)
     )
   })
 }
 
+# ── Apply the function to the combined data frame and save results ───────────
 alphas <- compute_kripp_alpha(
-  raw_classification,
+  df    = raw_classification,
   id    = "file_path",
   rater = "classifier"
 )
 
+# Write the alpha values to CSV for inclusion in analysis/appendix
 write_csv(alphas, "formatted/analysis/alphas.csv")
 ```
 
-```{r kappa}
-df_long <- raw_classification
-id_col <- "file_path"
-rater_col <- "classifier"
+```{r kappas_variable}
 
-# --- 1. which columns to evaluate? ---------------------------------
-flag_cols <- df_long %>%
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Calculates Cohen's κ for each variable
+# Output (csv): full kappa df, wide kappa df
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 0) Setup: data + key variables
+df <- raw_classification
+id_col <- "file_path"
+rater <- "classifier"
+
+# 1) Identify all TRUE/FALSE flag columns
+flag_cols <- df %>%
   select(where(is.logical)) %>%
   names()
 
-# --- 2. all pair combinations of classifiers -----------------------
-raters <- sort(unique(df_long[[rater_col]]))
-pairs <- combn(raters, 2, simplify = FALSE) # list of c("alpha","beta"), etc.
+# 2) Enumerate every unique pair of classifiers (α,β,γ,δ → 6 combos)
+pairs <- combn(sort(unique(df[[rater]])), 2, simplify = FALSE)
 
-# --- 3. helper ------------------------------------------------------
-kappa_pair <- function(df, col, r1, r2) {
+# 3) Helper: compute Cohen’s κ for one flag + one rater‐pair
+kappa_pair <- function(flag, r1, r2) {
+  # Pivot this one flag out: rows = units, cols = raters
   wide <- df %>%
-    filter(.data[[rater_col]] %in% c(r1, r2)) %>%
-    select(.data[[id_col]], .data[[rater_col]], !!sym(col)) %>%
-    pivot_wider(names_from = .data[[rater_col]], values_from = !!sym(col))
+    filter(.data[[rater]] %in% c(r1, r2)) %>%
+    select(all_of(c(id_col, rater, flag))) %>%
+    pivot_wider(names_from = rater, values_from = flag)
 
-  # keep units with ratings from both raters
-  wide <- wide %>% filter(!if_any(all_of(c(r1, r2)), is.na))
-  if (nrow(wide) == 0) {
+  # Keep only units both raters scored
+  wide <- wide %>% filter(!is.na(.data[[r1]]) & !is.na(.data[[r2]]))
+  if (nrow(wide) < 2) {
     return(NA_real_)
-  } # no overlap
+  } # not enough data
 
-  kappa2(wide[c(r1, r2)])$value
+  # Unweighted Cohen’s κ
+  kappa2(wide[c(r1, r2)], weight = "unweighted")$value
 }
 
-# --- 4. compute κ for every col × pair -----------------------------
-kappa_tbl <- map_dfr(flag_cols, function(col) {
-  map_dfr(pairs, function(p) {
+# 4) Compute κ for every (flag × pair) and save long-form results
+kappa_full <- map_dfr(flag_cols, function(flag) {
+  map_dfr(pairs, function(pr) {
+    val <- round(kappa_pair(flag, pr[1], pr[2]), 3)
     tibble(
-      column = col,
-      pair   = paste(p, collapse = "_"),
-      kappa  = round(kappa_pair(df_long, col, p[1], p[2]), 3)
+      column = flag,
+      pair   = paste(pr, collapse = "_"),
+      kappa  = val
     )
   })
 })
+write_csv(kappa_full, "formatted/analysis/kappa_full.csv")
 
-write_csv(kappa_tbl, "formatted/analysis/kappa_full.csv")
-
-# pivot to wider matrix
-kappa_wide <- kappa_tbl %>%
+# 5) Pivot wide and add per-flag summaries: mean / min / max κ
+kappa_wide <- kappa_full %>%
   pivot_wider(names_from = pair, values_from = kappa) %>%
   rowwise() %>%
   mutate(
     kappa_mean = round(mean(c_across(where(is.numeric)), na.rm = TRUE), 3),
     kappa_min  = min(c_across(where(is.numeric)), na.rm = TRUE),
-    kappa_max  = max(c_across(where(is.numeric)), na.rm = TRUE)
+    kappa_max  = max(c_across(where(is.numeric)), na.rm = TRUE),
   ) %>%
-  ungroup()
+  ungroup() %>%
+  select(column, kappa_mean, kappa_min, kappa_max, everything())
 
 write_csv(kappa_wide, "formatted/analysis/kappa_wide.csv")
+```
+
+```{r kappas_pairwise}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Calculates Cohen's κ for each trial, pairwise
+# Output (csv): pairwise kappa df
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 1) Load the combined, long-form classification file
+df <- raw_classification
+
+# 2) Identify all TRUE/FALSE flag columns
+flag_cols <- df %>%
+  select(where(is.logical)) %>%
+  names()
+
+# 3) Convert into one row per (file, flag, classifier)
+df_long <- df %>%
+  select(file_path, classifier, all_of(flag_cols)) %>%
+  pivot_longer(
+    cols      = all_of(flag_cols),
+    names_to  = "flag",
+    values_to = "value"
+  )
+
+# 4) Prepare all rater pairs
+raters <- sort(unique(df_long$classifier))
+pairs <- combn(raters, 2, simplify = FALSE)
+
+# 5) Compute a single Cohen’s κ for each pair across *all* flags
+pairwise_kappa <- map_dfr(pairs, function(p) {
+  r1 <- p[1]
+  r2 <- p[2]
+
+  # a) For this pair, pivot to columns r1 and r2
+  wide <- df_long %>%
+    filter(classifier %in% c(r1, r2)) %>%
+    pivot_wider(
+      names_from  = classifier,
+      values_from = value
+    ) %>%
+    # b) Keep only rows where both raters gave a TRUE/FALSE
+    drop_na(all_of(c(r1, r2)))
+
+  # c) Compute Cohen’s kappa
+  k <- kappa2(wide[c(r1, r2)], weight = "unweighted")$value
+
+  # d) Return a one‐row tibble
+  tibble(
+    pair  = paste(r1, r2, sep = "_"),
+    kappa = round(k, 3)
+  )
+})
+
+# 6) View or save
+write_csv(pairwise_kappa, "formatted/analysis/kappa_pairwise.csv")
 
 ```
 
 
 ```{r majority-rule}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Calculates majority rule (3/4 trials) for positive result
+# for binary variable columns
+# Output (df): df_majority
+# Output (csv): majority rule csv
+# ──────────────────────────────────────────────────────────────────────────────
+
 df_long <- raw_classification
 
 id_col <- "file_path"
@@ -262,18 +409,27 @@ df_majority <- df_long %>%
     ),
     .groups = "drop"
   )
+
+write_csv(df_majority, "formatted/analysis/majority_rule.csv")
 ```
 
-```{r summary-stats}
+```{r majority-any}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Calculates difference between percentage majority vs. percentage
+# "any" after majority rules. 
+# Output (csv): majority/any summary CSV for each variable
+# ──────────────────────────────────────────────────────────────────────────────
+
 # 1. identify the core flag names (everything that ends with "_maj")
-maj_cols  <- df_final %>% select(ends_with("_maj")) %>% names()
+maj_cols  <- df_majority %>% select(ends_with("_maj")) %>% names()
 flag_core <- str_remove(maj_cols, "_maj$")           # "right_access_and_copy", …
 
 # 2. build the matching *_any column names
 any_cols  <- paste0(flag_core, "_any")
 
 # 3. summarise: proportion TRUE  (×100 for percent)
-flag_summary <- df_final %>% 
+summary_majority_any <- df_majority %>% 
   summarise(
     across(all_of(maj_cols), ~ round(mean(.x, na.rm = TRUE) * 100, 3), .names = "{.col}_pct"),
     across(all_of(any_cols), ~ round(mean(.x, na.rm = TRUE) * 100, 3), .names = "{.col}_pct")
@@ -285,391 +441,463 @@ flag_summary <- df_final %>%
     diff = any - maj
   )
 
-print(flag_summary)
-
-sapply(df_majority, function(x) mean(is.na(x))) * 100
+write_csv(summary_majority_any, "formatted/analysis/majority_any.csv")
 
 ```
 
 
-```{r privacy_processing}
+```{r final-cleaning}
 
-privacy_national <- privacy %>%
-  filter(jurisdiction == "national") %>%
-  filter(!str_detect(jurisdiction_name, "Special Administrative Region")) %>%
-  mutate(jurisdiction_name = "People's Republic of China")
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Creates final "clean" df without intermediate steps
+# Output (df): df_final
+# Output (csv): final processed dataframe ("final_data.csv")
+# ──────────────────────────────────────────────────────────────────────────────
 
-privacy_provincial <- privacy %>%
-  filter(jurisdiction=="provincial") %>%
-  filter(jurisdiction_name != "Enshi Tujia and Miao Autonomous Prefecture") %>%
-  filter(jurisdiction_name != "Honghe Hani and Yi Autonomous Prefecture")
+df_final  <- df_majority %>% select(!ends_with("_any")) %>%
+  rename_with(.fn = ~ str_remove(., "_maj$"),
+              .cols = ends_with("_maj"))
 
-privacy_local <- privacy %>%
-  filter(jurisdiction == "city") %>%
-  mutate(jurisdiction_name = jurisdiction_name %>%
-      str_replace("City", "") %>%           # remove "City"
-      str_trim() %>%                        # strip leading/trailing spaces
-      paste("City")                         # add " City" at the end
-  )
-
-privacy_processed <- privacy %>%
-  filter(jurisdiction != "national") %>%
-  bind_rows(privacy_national) %>%
-  filter(jurisdiction != "provincial") %>%
-  bind_rows(privacy_provincial) %>%
-  filter(jurisdiction != "city") %>%
-  bind_rows(privacy_local) %>%
-  relocate(top_level_category, .after = date_enacted) %>%
-  rename(legal_status = top_level_category) %>%
-  mutate(date_enacted = dmy(date_enacted))
-
-write_csv(privacy_processed, "formatted/privacy.csv")
+write_csv(df_final, "formatted/analysis/final_data.csv")
 ```
 
-```{r dp_processing}
+```{r summary-tables}
 
-dp_national <- dp %>%
-  filter(jurisdiction == "national") %>%
-  filter(!str_detect(jurisdiction_name, "Special Administrative Region")) %>%
-  mutate(jurisdiction_name = "People's Republic of China")
-
-dp_provincial <- dp %>%
-  filter(jurisdiction=="provincial")
-
-dp_local <- dp %>%
-  filter(jurisdiction == "city") %>%
-  mutate(jurisdiction_name = jurisdiction_name %>%
-      str_replace("City", "") %>%           # remove "City"
-      str_trim() %>%                        # strip leading/trailing spaces
-      paste("City")                         # add " City" at the end
-  )
-
-dp_processed <- dp %>%
-  filter(jurisdiction != "national") %>%
-  bind_rows(dp_national) %>%
-  filter(jurisdiction != "provincial") %>%
-  bind_rows(dp_provincial) %>%
-  filter(jurisdiction != "city") %>%
-  bind_rows(dp_local) %>%
-  relocate(top_level_category, .after = date_enacted) %>%
-  rename(legal_status = top_level_category)%>%
-  mutate(date_enacted = dmy(date_enacted))
-
-write_csv(dp_processed, "formatted/data_protection.csv")
-```
-
-```{r intro-stats}
-
-dp_processed %>%
-  group_by(legal_status) %>%
-  summarise(n = n(), .groups = "drop") %>%      # count per group, then ungroup
-  mutate(percent = n / sum(n) * 100) 
-```
-
-```{r viz 1}
-
-df <- dp_processed %>% 
-  bind_rows(privacy_processed)
-
-df <- df %>% mutate(
-  year = year(date_enacted))
-
-counts <- df %>%
-  group_by(year, folder) %>%
-  summarise(count = n(), .groups = 'drop') %>%
-  filter(year >= 2004) %>%
-  arrange(asc(year))
-
-ggplot(counts, aes(x = factor(year), y = count, fill = folder)) +
-  geom_bar(stat = "identity", position = "dodge") +
-  coord_flip() +
-  labs(
-    title = "Legislation by Keyword Per Year",
-    x = "Year",
-    y = "Number of Documents",
-    fill = "Category"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")+ 
-  scale_fill_discrete(labels = c("privacy" = "Privacy", "data protection" = "Personal Information Protection")) + 
-  geom_vline(xintercept = which(levels(factor(counts$year)) == "2021"), 
-             linetype = "dashed", color = "black")
-
-```
-```{r}
-privacy_processed %>%
-  group_by(general_reference) %>%
-  summarise(n = n(), .groups = "drop") %>%      # count per group, then ungroup
-  mutate(percent = n / sum(n) * 100) 
-
-dp_processed %>%
-  group_by(general_reference) %>%
-  summarise(n = n(), .groups = "drop") %>%      # count per group, then ungroup
-  mutate(percent = n / sum(n) * 100) 
-```
-
-```{r viz 2}
-
-privacy_processed <- privacy_processed %>% mutate(
-  year = year(date_enacted))
-
-counts <- privacy_processed %>%
-  group_by(year, folder) %>%
-  summarise(count = n(), .groups = 'drop') %>%
-  filter(!is.na(year)) %>%
-  arrange(year)
-
-ggplot(counts, aes(x = factor(year), y = count, fill = folder)) +
-  geom_bar(stat = "identity", position = "dodge") +
-  coord_flip() +
-  labs(
-    title = "Privacy-Related Legislation",
-    x = "Year",
-    y = "Number of Documents",
-    fill = "Category"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "none")+ 
-  scale_fill_manual(
-    values = c("privacy" = "#00BFC4", "data protection" = "gray"),
-    labels = c("privacy" = "Privacy", "data protection" = "Data Protection")
-  ) + 
-  geom_vline(xintercept = which(levels(factor(counts$year)) == "2021"), 
-             linetype = "dashed", color = "black")
-```
-
-```{r}
-new <- df %>%
-  filter(general_reference == "FALSE") %>%
-  mutate(year = year(date_enacted),
-         before_pipl = if_else(year < 2021, TRUE, FALSE),
-         n_rights = str_count(individual_rights, ",") + ifelse(str_detect(individual_rights, "\\[\\s*\\]"), 0, 1))
-
-mean_before_after <- new %>%
-  group_by(before_pipl) %>%
-  summarize(mean = mean(n_rights))
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Creates summary stat (5x47 tables) for all 3 corpora (privacy,
+# data protection, and combined)
+# Output (df): summary_privacy, summary_data_protection
+# Output (csv): summary_privacy.csv, summary_data_protection.csv
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-```
-
-```{r}
-rights <- c(
-  "Know & Decide", "Access & Copy", "Rectification",
-  "Erasure", "Explanation", "Next of Kin", "Convenient Exercise & Remedy"
-)
-
-for (right in rights) {
-  colname <- make.names(right)  # Safe column name
-  new[[colname]] <- str_detect(new$individual_rights, fixed(right))
+make_summary <- function(df, category_value) {
+  # 1. filter to this top level category
+  df_sub <- df %>% filter(top_level_category == category_value)
+  
+  # 2. get all binary-flag columns (logical)
+  flag_cols <- df_sub %>% select(where(is.logical)) %>% names()
+  
+  # 3. for each flag, compute the four percentages
+  map_dfr(flag_cols, function(flag) {
+    # total counts for each general_reference group
+    n_false <- sum(!df_sub$general_reference, na.rm = TRUE)
+    n_true  <- sum( df_sub$general_reference, na.rm = TRUE)
+    
+    # counts of flag == TRUE within each group
+    ct_ft <- sum(!df_sub$general_reference & df_sub[[flag]], na.rm = TRUE)
+    ct_tt <- sum( df_sub$general_reference & df_sub[[flag]], na.rm = TRUE)
+    
+    # build one summary row
+    tibble(
+      flag                    = flag,
+      substantive_true          = round(ct_ft  / n_false * 100, 2),
+      substantive_false         = round((n_false - ct_ft) / n_false * 100, 2),
+      nonsubstantive_true           = round(ct_tt  / n_true  * 100, 2),
+      nonsubstantive_false          = round((n_true  - ct_tt) / n_true  * 100, 2)
+    )
+  })
 }
 
-new_long <- new %>%
-  pivot_longer(cols = all_of(make.names(rights)),
-               names_to = "right",
-               values_to = "present") %>%
-  filter(present == TRUE)
+# Apply it to both categories:
+summary_data_protection <- make_summary(df_final, "data_protection")
+summary_privacy         <- make_summary(df_final, "privacy")
 
-# Your original labels after make.names()
-old_names <- make.names(c(
-  "Know & Decide", "Access & Copy", "Rectification",
-  "Erasure", "Explanation", "Next of Kin", "Convenient Exercise & Remedy"
-))
+write_csv(summary_data_protection, "formatted/analysis/summary_data_protection.csv")
+write_csv(summary_data_protection, "formatted/analysis/summary_privacy")
+```
 
-# Desired display labels
-pretty_labels <- c(
-  "Know & Decide", "Access & Copy", "Rectification",
-  "Erasure", "Explanation", "Next of Kin", "Convenient Exercise & Remedy"
-)
+```{r geographies, warning = FALSE}
 
-# Create named vector: names = old column names, values = display names
-label_map <- setNames(pretty_labels, old_names)
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Creates tables summarizing n legislation for cities and provinces
+# Output (df): df_cities, df_province
+# Output (csv): df_cities, df_province
+# ──────────────────────────────────────────────────────────────────────────────
 
-new_long %>%
-  count(right, before_pipl) %>%
-  mutate(right = label_map[right]) %>%  # Replace with pretty label
-  ggplot(aes(x = reorder(right, n), y = n, fill = before_pipl)) +
-  geom_col(position = "dodge") +
-  coord_flip() +
-  labs(
-    title = "Frequency of Individual Rights Referenced",
-    x = "Right",
-    y = "Count"
-  ) + 
-  theme_minimal() + 
-  scale_fill_manual(
-  name = "Period",
-  values = c("TRUE" = "#00bfc4", "FALSE" = "#f8766d"),
-  labels = c("TRUE" = "Pre-PIPL", "FALSE" = "Post-PIPL")
-)
+df_cities <- df_final %>%
+  filter(jurisdiction == "city") %>%      # keep only cities
+  group_by(jurisdiction_name) %>%
+  summarize(
+    # count distinct laws where general_reference is FALSE
+    n_substantive    = n_distinct(title[general_reference == FALSE]),
+    # count distinct laws where general_reference is TRUE
+    n_non_substantive = n_distinct(title[general_reference == TRUE]),
+    # earliest enactment *among substantive* (optional)
+    p_substantive = round(n_substantive / (n_substantive + n_non_substantive), 3),
+    earliest_substantive_year = year(
+      min( ymd(date_enacted)[ general_reference == FALSE ] , na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_substantive))
+
+write_csv(df_cities, "formatted/analysis/df_cities.csv")
+
+df_province <- df_final %>%
+  filter(jurisdiction == "provincial") %>%      # keep only cities
+  group_by(jurisdiction_name) %>%
+  summarize(
+    # count distinct laws where general_reference is FALSE
+    n_substantive    = n_distinct(title[general_reference == FALSE]),
+    # count distinct laws where general_reference is TRUE
+    n_non_substantive = n_distinct(title[general_reference == TRUE]),
+    # earliest enactment *among substantive* (optional)
+    p_substantive = round(n_substantive / (n_substantive + n_non_substantive), 3),
+    earliest_substantive_year = year(
+      min( ymd(date_enacted)[ general_reference == FALSE ] , na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_substantive))
+
+
+write_csv(df_province, "formatted/analysis/df_province.csv")
 
 ```
 
-```{r}
-# Define the responsibilities
-responsibilities <- c(
-  "Security & Management", "Protection Officer", "Local Representative",
-  "Compliance Audits", "Impact Assessment", "Incident Response & Notification",
-  "Platform Compliance", "Outsourced Processing"
-)
+```{r pipl-mention-timeline}
 
-# Safely create column names and detect presence
-for (resp in responsibilities) {
-  colname <- make.names(resp)
-  new[[colname]] <- str_detect(new$handler_responsibilities, fixed(resp))
-}
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Creates table with history of PIPL-referencing legislation
+# Output (df): pipl_timeline
+# Output (csv): pipl_timeline
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Pivot to long format
-new_long_resp <- new %>%
-  pivot_longer(cols = all_of(make.names(responsibilities)),
-               names_to = "responsibility",
-               values_to = "present") %>%
-  filter(present == TRUE)
+pipl_timeline <- df_final %>%
+  filter(pipl_mention == TRUE)
+  
+  
+# Clean names used for flag columns
+rights_cols <- tolower(rights) %>%
+  str_replace_all("&", "and") %>%
+  str_replace_all("[^a-z0-9]+", "_") %>%
+  str_remove("_$") %>%
+  paste0("right_", .)
 
-# Create label map
-old_resp_names <- make.names(responsibilities)
-pretty_resp_labels <- responsibilities
-label_map_resp <- setNames(pretty_resp_labels, old_resp_names)
+resp_cols <- tolower(responsibilities) %>%
+  str_replace_all("&", "and") %>%
+  str_replace_all("[^a-z0-9]+", "_") %>%
+  str_remove("_$") %>%
+  paste0("resp_", .)
 
-# Plot
-new_long_resp %>%
-  filter(!is.na(before_pipl)) %>%
-  count(responsibility, before_pipl) %>%
-  mutate(responsibility = label_map_resp[responsibility]) %>%
-  ggplot(aes(x = reorder(responsibility, n), y = n, fill = before_pipl)) +
-  geom_col(position = "dodge") +
-  coord_flip() +
-  labs(
-    title = "Frequency of Data Handler Responsibilities Referenced",
-    x = "Responsibility",
-    y = "Count"
-  ) +
-  theme_minimal() +
-  scale_fill_manual(
-    name = "Period",
-    values = c("TRUE" = "#00bfc4", "FALSE" = "#f8766d"),
-    labels = c("TRUE" = "Pre-PIPL", "FALSE" = "Post-PIPL")
-  )
-```
-```{r}
-# Define the list of special PIPL terms
-keywords <- c(
-  "Parental Consent for Minors", 
-  "Cross-Border Transfer", 
-  "Automated Decision-Making Transparency", 
-  "De-Identification", 
-  "Anonymization"
-)
+kw_cols <- tolower(keywords) %>%
+  str_replace_all("&", "and") %>%
+  str_replace_all("[^a-z0-9]+", "_") %>%
+  str_remove("_$") %>%
+  paste0("kw_", .)
 
-# Create logical columns for each keyword
-for (kw in keywords) {
-  colname <- make.names(kw)
-  new[[colname]] <- str_detect(new$keywords, fixed(kw))
-}
-
-# Pivot longer
-new_long_kw <- new %>%
-  pivot_longer(cols = all_of(make.names(keywords)),
-               names_to = "keyword",
-               values_to = "present") %>%
-  filter(present == TRUE)
-
-# Pretty label mapping
-old_kw_names <- make.names(keywords)
-pretty_kw_labels <- keywords
-label_map_kw <- setNames(pretty_kw_labels, old_kw_names)
-
-# Plot
-new_long_kw %>%
-  count(keyword, before_pipl) %>%
-  mutate(keyword = label_map_kw[keyword]) %>%
-  ggplot(aes(x = reorder(keyword, n), y = n, fill = before_pipl)) +
-  geom_col(position = "dodge") +
-  coord_flip() +
-  labs(
-    title = "Frequency of PIPL-Defined Keywords Referenced",
-    x = "Keyword",
-    y = "Count"
-  ) +
-  theme_minimal() +
-  scale_fill_manual(
-    name = "Period",
-    values = c("TRUE" = "#00bfc4", "FALSE" = "#f8766d"),
-    labels = c("TRUE" = "Pre-PIPL", "FALSE" = "Post-PIPL")
-  )
-```
-```{r}
-new <- new %>%
+pipl_timeline <- df_final %>%
+  filter(pipl_mention == TRUE) %>%
+  rowwise() %>%
   mutate(
-    n_rights = str_count(individual_rights, ",") + ifelse(str_detect(individual_rights, "\\[\\s*\\]"), 0, 1),
-    n_responsibilities = str_count(handler_responsibilities, ",") + ifelse(str_detect(handler_responsibilities, "\\[\\s*\\]"), 0, 1),
-    n_keywords = str_count(keywords, ",") + ifelse(str_detect(keywords, "\\[\\s*\\]"), 0, 1)
+    # for each rights_* column, if TRUE, record its index in the rights vector
+    rights_enumerated = {
+      idx <- which(c_across(all_of(rights_cols)))
+      if (length(idx)) str_c(idx, collapse = ", ") else ""
+    },
+    # same for responsibilities
+    resp_enumerated = {
+      idx <- which(c_across(all_of(resp_cols)))
+      if (length(idx)) str_c(idx, collapse = ", ") else ""
+    },
+    # and for keywords
+    keywords_enumerated = {
+      idx <- which(c_across(all_of(kw_cols)))
+      if (length(idx)) str_c(idx, collapse = ", ") else ""
+    },
+  ) %>%
+  ungroup() %>%
+  mutate(file_path = str_remove(file_path, "^[^/]+/") ) %>%
+  distinct(file_path, .keep_all = TRUE) %>%
+  select(title, date_enacted, jurisdiction, jurisdiction_name, sensitive_data,
+         rights_enumerated, resp_enumerated, keywords_enumerated, synopsis) %>%
+  arrange(date_enacted)
+
+write_csv(pipl_timeline, "formatted/analysis/pipl_timeline.csv")
+```
+
+
+```{r pipl-prepost-rates, warning = FALSE}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Creates two summary tables for an output metric — mean number of each
+# PIPL-enumerated right, responsibilitie, and keyword — for pre-PIPL (2021) 
+# and post-PIPL. Runs a t-test on the significance of these differences.
+# Output (df): pipl_prepost_rates
+# Output (csv): pipl_prepost_rates
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── 1) Load data & define pre/post group ────────────────────────────────────
+df <- df_final %>%
+  filter(general_reference == FALSE) %>%
+  mutate(
+    year = year(ymd(date_enacted)),
+    period = if_else(year <= 2020, "pre", "post")
   )
 
-# Group by PIPL mention (TRUE/FALSE) and calculate means
-new %>%
-  group_by(pipl_mention) %>%
-  summarise(
-    avg_rights = mean(n_rights, na.rm = TRUE),
-    avg_responsibilities = mean(n_responsibilities, na.rm = TRUE),
-    avg_keywords = mean(n_keywords, na.rm = TRUE),
-    n = n()
+# ── 2) Identify all binary-flag columns (logical) ──────────────────────────
+flag_cols <- df %>% select(where(is.logical)) %>% names()
+
+# ── 3) Two‐sample test of proportions for each flag ──────────────────────────
+pipl_prepost_rates <- map_dfr(flag_cols, function(flag) {
+  # counts of TRUE in each period
+  tab <- df %>%
+    group_by(period) %>%
+    summarise(
+      pos = sum(.data[[flag]], na.rm = TRUE),
+      tot = sum(!is.na(.data[[flag]])),
+      .groups = "drop"
+    ) %>%
+    arrange(period)
+  # prop.test requires vectors of successes and totals
+  pt <- prop.test(x = tab$pos, n = tab$tot)
+  
+  tibble(
+    flag       = flag,
+    prop_post   = round(tab$pos[1] / tab$tot[1] * 100, 2),
+    prop_pre  = round(tab$pos[2] / tab$tot[2] * 100, 2),
+    diff = round(prop_post - prop_pre, 2),
+    p_value    = pt$p.value, 3,
+    conf_low   = pt$conf.int[1] * 100,
+    conf_high  = pt$conf.int[2] * 100
+  )
+})
+
+# write out results
+write_csv(pipl_prepost_rates, "formatted/analysis/pipl_prepost_rates.csv")
+```
+```
+
+
+```{r pipl-mention-rates, warning = FALSE}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Creates two summary tables for an output metric — mean number of each
+# PIPL-enumerated right, responsibilities, and keyword — for mentions of PIPL.
+# Runs a t-test on the significance of these differences.
+# Output (df): pipl_mention_rates
+# Output (csv): pipl_mention_rates
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── 1) Load data & define pre/post group ────────────────────────────────────
+df <- df_final %>%
+  filter(general_reference == FALSE) 
+
+# ── 2) Identify all binary-flag columns (logical) ──────────────────────────
+flag_cols <- df %>% select(where(is.logical)) %>% names()
+
+# ── 3) Two‐sample test of proportions for each flag ──────────────────────────
+pipl_mention_rates <- map_dfr(flag_cols, function(flag) {
+  # counts of TRUE in each period
+  tab <- df %>%
+    group_by(pipl_mention) %>%
+    summarise(
+      pos = sum(.data[[flag]], na.rm = TRUE),
+      tot = sum(!is.na(.data[[flag]])),
+      .groups = "drop"
+    ) %>%
+    arrange(pipl_mention)
+  # prop.test requires vectors of successes and totals
+  pt <- prop.test(x = tab$pos, n = tab$tot)
+  
+  tibble(
+    flag       = flag,
+    prop_no_mention   = round(tab$pos[1] / tab$tot[1] * 100, 2),
+    prop_mention  = round(tab$pos[2] / tab$tot[2] * 100, 2),
+    diff = prop_mention - prop_no_mention,
+    p_value    = pt$p.value, 3,
+    conf_low  = -pt$conf.int[2] * 100,
+    conf_high   = -pt$conf.int[1] * 100
+  )
+})
+
+# write out results
+write_csv(pipl_mention_rates, "formatted/analysis/pipl_mention_rates.csv")
+```
+
+```{r pipl-prepost-numbers}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Creates summary table for # of keywords, rights, responsibilities
+# both before and after PIPL.
+# Runs a t-test on the significance of these differences.
+# Output (df): pipl_prepost_numbers
+# Output (csv): pipl_prepost_numbers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 1) Load data
+df <- df_final %>%
+  filter(general_reference == FALSE) %>%
+  mutate(
+    year   = year(ymd(date_enacted)),
+    period = factor(if_else(year <= 2020, "pre", "post"),
+                    levels = c("pre","post"))
   )
 
-t.test(n_rights ~ pipl_mention, data = new)
-t.test(n_responsibilities ~ pipl_mention, data = new)
-t.test(n_keywords ~ pipl_mention, data = new)
+# 2) Run two‐sample t‐tests for each count variable
+#    (assumes roughly normal distribution of counts)
+tt_rights <- t.test(rights_count ~ period, data = df_counts)
+tt_resp   <- t.test(resp_count   ~ period, data = df_counts)
+tt_kw     <- t.test(kw_count     ~ period, data = df_counts)
+
+# 3) Extract test results into a single tibble
+pipl_prepost_numbers <- tibble(
+  variable   = c("rights_count", "resp_count", "kw_count"),
+  mean_pre   = c(tt_rights$estimate[1], tt_resp$estimate[1], tt_kw$estimate[1]),
+  mean_post  = c(tt_rights$estimate[2], tt_resp$estimate[2], tt_kw$estimate[2]),
+  diff = round(mean_post - mean_pre, 3),
+  t_stat     = c(unname(tt_rights$statistic),
+                 unname(tt_resp$statistic),
+                 unname(tt_kw$statistic)),
+  df         = c(tt_rights$parameter,
+                 tt_resp$parameter,
+                 tt_kw$parameter),
+  p_value    = c(tt_rights$p.value,
+                 tt_resp$p.value,
+                 tt_kw$p.value),
+  conf_low  = c(-tt_rights$conf.int[2],
+                 -tt_resp$conf.int[2],
+                 -tt_kw$conf.int[2]),
+  conf_high   = c(-tt_rights$conf.int[1],
+                 -tt_resp$conf.int[1],
+                 -tt_kw$conf.int[1])
+  
+)
+
+# 4) Save results
+write_csv(pipl_prepost_numbers,  "formatted/analysis/pipl_prepost_numbers.csv")
+
 ```
 
-```{r}
-new %>% 
-  group_by(jurisdiction) %>%
-  summarise(n = n(), .groups = "drop") %>%      # count per group, then ungroup
-  mutate(percent = n / sum(n) * 100) 
+```{r pipl-mention-numbers}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Creates summary table for # of keywords, rights, responsibilities
+# both based on PIPL mention.
+# Runs a t-test on the significance of these differences.
+# Output (df): pipl_mention_numbers
+# Output (csv): pipl_mention_numbers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 1) Load data
+df <- df_final %>%
+  filter(general_reference == FALSE)
+
+# 2) Run two‐sample t‐tests for each count variable
+#    (assumes roughly normal distribution of counts)
+tt_rights <- t.test(rights_count ~ pipl_mention, data = df_counts)
+tt_resp   <- t.test(resp_count   ~ pipl_mention, data = df_counts)
+tt_kw     <- t.test(kw_count     ~ pipl_mention, data = df_counts)
+
+# 3) Extract test results into a single tibble
+pipl_mention_numbers <- tibble(
+  variable   = c("rights_count", "resp_count", "kw_count"),
+  mean_no_mention   = c(tt_rights$estimate[1], tt_resp$estimate[1], tt_kw$estimate[1]),
+  mean_mention  = c(tt_rights$estimate[2], tt_resp$estimate[2], tt_kw$estimate[2]),
+  diff = round(mean_mention - mean_no_mention, 3),
+  t_stat     = c(unname(tt_rights$statistic),
+                 unname(tt_resp$statistic),
+                 unname(tt_kw$statistic)),
+  df         = c(tt_rights$parameter,
+                 tt_resp$parameter,
+                 tt_kw$parameter),
+  p_value    = c(tt_rights$p.value,
+                 tt_resp$p.value,
+                 tt_kw$p.value),
+  conf_low  = c(-tt_rights$conf.int[2],
+                 -tt_resp$conf.int[2],
+                 -tt_kw$conf.int[2]),
+  conf_high   = c(-tt_rights$conf.int[1],
+                 -tt_resp$conf.int[1],
+                 -tt_kw$conf.int[1])
+  
+)
+
+# 4) Save results
+write_csv(pipl_mention_numbers,  "formatted/analysis/pipl_mention_numbers")
+
+```
+
+```{r substances}
+overview_substance <- df_final %>%
+  mutate(substantive = as.integer(!general_reference)) %>%
+  group_by(top_level_category, general_reference) %>%
+  summarize(n = n()) %>%
+  pivot_wider(names_from = "general_reference", values_from = "n") %>%
+  rename(substantive = `FALSE`,
+         non_substantive = `TRUE`) %>%
+  mutate(p_sub = round(substantive / (substantive + non_substantive), 3))
+
+write_csv(overview_substance, "formatted/analysis/overview_substance.csv")
 ```
 
 
-```{r}
-library(tidyverse)
+```{r substantivity-did}
 
-# Convert string like "['Education', 'Health']" into list-column
-new_cleaned <- new %>%
-  mutate(sector = str_remove_all(sector, "\\[|\\]|'")) %>%     # remove brackets and quotes
-  mutate(sector = str_split(sector, ",")) %>%                  # split into character vectors
-  mutate(sector = map(sector, str_trim))                       # trim whitespace from each
+# ──────────────────────────────────────────────────────────────────────────────
+# Function: Analyzes difference in substantivity through two IVs: 
+# 1) pre-/post-PIPL
+# 2) PIPL mention
+# Runs a t-test on the significance of these differences.
+# Output (df): substantivity_tests
+# Output (csv): substantivity_tests
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Unnest sectors to long format
-sector_counts <- new_cleaned %>%
-  unnest(sector) %>%
-  distinct(file_path, sector) %>%        # optional: count each sector once per doc
-  count(sector, name = "count") %>%
-  mutate(percentage = count / nrow(new_cleaned) * 100)
+# 1) Load data & define pre/post‐PIPL period
+df <- df_final %>%
+  mutate(
+    year    = year(ymd(date_enacted)),
+    period  = if_else(year <= 2020,  "pre",  "post"),
+    # 2) Define substantive indicator: TRUE if general_reference == FALSE
+    substantive = as.integer(!general_reference)
+  )
+
+# ── 2) T-test: substantive before vs. after PIPL ─────────────────────────────
+tt_period <- t.test(substantive ~ period, data = df)
+
+period_test <- tibble(
+  comparison = "post-PIPL",
+  mean_false   = tt_period$estimate["mean in group pre"],
+  mean_true  = tt_period$estimate["mean in group post"],
+  diff = mean_true - mean_false,
+  t_stat     = unname(tt_period$statistic),
+  df         = tt_period$parameter,
+  p_value    = tt_period$p.value,
+  conf_low   = tt_period$conf.int[1],
+  conf_high  = tt_period$conf.int[2]
+)
+
+# ── 3) T-test: substantive by whether PIPL itself is mentioned ───────────────
+tt_pipl <- t.test(substantive ~ pipl_mention, data = df)
+
+pipl_test <- tibble(
+  comparison = "PIPL mention",
+  mean_false    = tt_pipl$estimate["mean in group FALSE"],
+  mean_true   = tt_pipl$estimate["mean in group TRUE"],
+  diff = mean_true - mean_false,
+  t_stat     = unname(tt_pipl$statistic),
+  df         = tt_pipl$parameter,
+  p_value    = tt_pipl$p.value,
+  conf_low   = -tt_pipl$conf.int[2],
+  conf_high  = -tt_pipl$conf.int[1]
+)
+
+# ── 4) Combine & save test results ───────────────────────────────────────────
+substantivity_tests <- bind_rows(period_test, pipl_test)
+write_csv(substantivity_tests, "formatted/analysis/substantivity_tests.csv")
 
 
-sc <- sector_counts %>%
-  arrange(desc(percentage))
 ```
 
-
-```{r}
-library(tidyverse)
-
-# Convert string like "['Education', 'Health']" into list-column
-new_cleaned <- new %>%
-  mutate(solove_classification = str_remove_all(solove_classification, "\\[|\\]|'")) %>%     # remove brackets and quotes
-  mutate(solove_classification = str_split(solove_classification, ",")) %>%                  # split into character vectors
-  mutate(solove_classification = map(solove_classification, str_trim))                       # trim whitespace from each
-
-# Unnest sectors to long format
-solove_counts <- new_cleaned %>%
-  unnest(solove_classification) %>%
-  distinct(file_path, solove_classification) %>%        # optional: count each sector once per doc
-  count(solove_classification, name = "count") %>%
-  mutate(percentage = count / nrow(new_cleaned) * 100)
-
-
-sc <- solove_counts %>%
-  arrange(desc(percentage))
-```
-
+```{r first_table}
+df_final %>%
+  filter(top_level_category == "data_protection") %>%
+  mutate(file_path = str_remove(file_path, "^[^/]+/"),
+         file_path = str_remove(file_path, "/[^/]+")) %>%
+  group_by(file_path) %>%
+  summarize(count = n(),
+            pct = count / 398)
+  
 ```
 
